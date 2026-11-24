@@ -70,9 +70,13 @@ Three commands, in the order the failures actually happen.
 
 ```shell
 # 1. No credentials: refuses to start rather than connecting somewhere by default.
+#    Move .env.local aside first — godotenv loads that file, and a value in it
+#    counts as configuration.
+mv .env.local .env.local.bak
 env -u MQTT_BROKER -u MQTT_USER -u MQTT_PASS go run main.go; echo "exit=$?"
 # level=ERROR msg="missing required configuration" vars="[MQTT_BROKER MQTT_USER MQTT_PASS]" ...
 # exit=2
+mv .env.local.bak .env.local
 
 # 2. Credentials but no I2C device: connects, reports why, goes offline, exits.
 go run main.go; echo "exit=$?"      # with /dev/i2c-1 absent
