@@ -34,3 +34,6 @@ ca.crt
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Local build output
+/parking-gate
