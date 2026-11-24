@@ -5,12 +5,16 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/joho/godotenv"
 
@@ -24,33 +28,283 @@ const (
 )
 
 const (
-	cmdTopic   = "parking/gate/command"  // open / close
-	stateTopic = "parking/gate/state"    // online / offline
-	gateTopic  = "parking/gate/position" // open / close (actual barrier position)
+	cmdTopic      = "parking/gate/command"  // open / close
+	stateTopic    = "parking/gate/state"    // online / offline
+	positionTopic = "parking/gate/position" // open / close (actual barrier position)
+	healthTopic   = "parking/gate/health"   // retained JSON diagnostics
 )
 
-var (
-	broker   string
-	clientId string
-	username string
-	password string
+// Exit codes separate the failure classes a supervisor has to tell apart: a
+// restart policy that fits a missing cable does not fit a refused password.
+const (
+	exitHardware = 1 // I2C bus, PCA9685 or servo could not be brought up
+	exitConfig   = 2 // missing or invalid configuration
+	exitBroker   = 3 // broker unreachable, or authentication refused
 )
+
+const (
+	stateOnline  = "online"
+	stateOffline = "offline"
+
+	positionOpen   = "open"
+	positionClosed = "close"
+
+	defaultOpenAngle = 90
+)
+
+// healthReport is the retained payload on healthTopic. It carries what the
+// start-up sequence managed to bring up, so a subscriber never has to read the
+// process log to find out why a gate did not move.
+type healthReport struct {
+	OK       bool     `json:"ok"`
+	Symptoms []string `json:"symptoms,omitempty"`
+	ClientID string   `json:"client_id"`
+	At       string   `json:"at"`
+}
 
 func main() {
 	// Load .env.local if present; existing environment variables take precedence.
 	if err := godotenv.Load(".env.local"); err != nil && !os.IsNotExist(err) {
 		slog.Warn("failed to load .env.local", "err", err)
 	}
+	initLogging()
 
-	broker = os.Getenv("MQTT_BROKER")
-	username = os.Getenv("MQTT_USER")
-	password = os.Getenv("MQTT_PASS")
-	clientId = os.Getenv("MQTT_CLIENT_ID")
-	if clientId == "" {
-		clientId = generateClientID()
+	// Broker credentials are required. There is no fallback: a default that
+	// works is a credential in a public repository.
+	var missing []string
+	for _, key := range []string{"MQTT_BROKER", "MQTT_USER", "MQTT_PASS"} {
+		if os.Getenv(key) == "" {
+			missing = append(missing, key)
+		}
+	}
+	if len(missing) > 0 {
+		slog.Error("missing required configuration", "vars", missing, "hint", "copy .env.example to .env.local and fill it in")
+		os.Exit(exitConfig)
+	}
+	broker := os.Getenv("MQTT_BROKER")
+	username := os.Getenv("MQTT_USER")
+	password := os.Getenv("MQTT_PASS")
+
+	clientID := os.Getenv("MQTT_CLIENT_ID")
+	if clientID == "" {
+		clientID = generateClientID()
 	}
 
-	// Initialize slog: default Info level, output to stderr; adjustable via LOG_LEVEL.
+	openAngle, err := openAngleFromEnv()
+	if err != nil {
+		slog.Error("invalid configuration", "err", err)
+		os.Exit(exitConfig)
+	}
+
+	// 1-3. Bring the hardware up. A failure here is not fatal yet: the symptoms
+	// are reported over MQTT before the process exits, so the reason is visible
+	// from the same place the commands arrive.
+	bus, servo, symptoms := initHardware()
+	if bus != nil {
+		defer bus.Close()
+	}
+	hardwareOK := len(symptoms) == 0
+	if hardwareOK {
+		slog.Info("system ready, barrier lowered", "open_angle", openAngle)
+	}
+
+	// 4. Connect to MQTT.
+	tlsConfig, err := loadTLSConfig(caFile)
+	if err != nil {
+		slog.Error("failed to load CA certificate", "file", caFile, "err", err)
+		os.Exit(exitConfig)
+	}
+
+	opts := mqtt.NewClientOptions()
+	opts.AddBroker(broker)
+	opts.SetClientID(clientID)
+	opts.SetUsername(username)
+	opts.SetPassword(password)
+	opts.SetTLSConfig(tlsConfig)
+	// Let the broker publish the offline state if the client drops unexpectedly.
+	opts.SetWill(stateTopic, stateOffline, 1, true)
+	// Every connection — the first one and every reconnect — re-publishes the
+	// state and re-subscribes. paho does not restore subscriptions after a
+	// reconnect unless the broker keeps the session, and a device that loses its
+	// subscription on a brief network drop is a device someone has to walk up to
+	// and restart.
+	//
+	// The handler runs in its own goroutine, so Connect() returning only means the
+	// broker sent CONNACK — not that our state and health are on the wire yet.
+	// firstConnect closes once those publishes have been acknowledged, which is
+	// what the hardware-failure path below waits for before disconnecting.
+	firstConnect := make(chan struct{})
+	var firstConnectOnce sync.Once
+	opts.SetOnConnectHandler(func(c mqtt.Client) {
+		onConnect(c, hardwareOK, symptoms, clientID, servo, openAngle)
+		firstConnectOnce.Do(func() { close(firstConnect) })
+	})
+
+	client := mqtt.NewClient(opts)
+	if token := client.Connect(); token.Wait() && token.Error() != nil {
+		slog.Error("connection failed", "broker", broker, "err", token.Error())
+		os.Exit(exitBroker)
+	}
+	slog.Info("MQTT connection established", "broker", broker, "client_id", clientID)
+
+	select {
+	case <-firstConnect:
+	case <-time.After(10 * time.Second):
+		slog.Warn("state and health were not published within 10s of connecting")
+	}
+
+	// 5. A gate that cannot move is not a gate. The diagnostics are already on
+	// healthTopic and state reads offline; leave the process so a supervisor
+	// restarts it.
+	if !hardwareOK {
+		slog.Error("hardware not ready, diagnostics published", "symptoms", symptoms)
+		client.Disconnect(250)
+		os.Exit(exitHardware)
+	}
+
+	// 6. Wait for an exit signal.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
+	slog.Info("received exit signal, shutting down...")
+
+	// Publish the offline state proactively (retained, QoS 1).
+	if publishRetained(client, stateTopic, stateOffline) {
+		slog.Info("published offline state", "topic", stateTopic)
+	}
+
+	client.Disconnect(250)
+}
+
+// onConnect runs on the first connection and on every reconnect. It is the only
+// place that publishes the online state and subscribes, so there is exactly one
+// code path that can leave the device half-connected.
+func onConnect(c mqtt.Client, hardwareOK bool, symptoms []string, clientID string, servo *pca9685.Servo, openAngle int) {
+	state := stateOnline
+	if !hardwareOK {
+		state = stateOffline
+	}
+	publishRetained(c, stateTopic, state)
+	publishHealth(c, hardwareOK, symptoms, clientID)
+
+	if !hardwareOK {
+		return
+	}
+
+	if token := c.Subscribe(cmdTopic, 1, commandHandler(c, servo, openAngle)); token.Wait() && token.Error() != nil {
+		slog.Error("subscription failed", "topic", cmdTopic, "err", token.Error())
+		return
+	}
+	slog.Info("subscribed to commands", "topic", cmdTopic)
+}
+
+// commandHandler reacts to open / close. The position is published from a
+// separate goroutine so a slow broker cannot stall the MQTT callback.
+func commandHandler(c mqtt.Client, servo *pca9685.Servo, openAngle int) mqtt.MessageHandler {
+	return func(_ mqtt.Client, m mqtt.Message) {
+		cmd := strings.TrimSpace(string(m.Payload()))
+		slog.Info("received command", "cmd", cmd)
+
+		switch cmd {
+		case positionOpen:
+			if err := servo.Angle(openAngle); err != nil {
+				slog.Error("failed to raise the barrier", "angle", openAngle, "err", err)
+				return
+			}
+			slog.Info("barrier raised", "angle", openAngle)
+			go publishRetained(c, positionTopic, positionOpen)
+		case positionClosed:
+			if err := servo.Angle(0); err != nil {
+				slog.Error("failed to lower the barrier", "err", err)
+				return
+			}
+			slog.Info("barrier lowered")
+			go publishRetained(c, positionTopic, positionClosed)
+		default:
+			slog.Warn("unknown command", "cmd", cmd)
+		}
+	}
+}
+
+// initHardware opens the bus, initialises the controller and parks the barrier.
+// Failures are collected rather than returned: the caller still needs a client to
+// report them. The bus is returned so the caller keeps it open for the lifetime
+// of the process — closing it here would leave the servo unreachable.
+func initHardware() (*i2c.Options, *pca9685.Servo, []string) {
+	// 1. Open the I2C bus (typically /dev/i2c-1 on Raspberry Pi 4/5).
+	bus, err := i2c.New(pca9685.Address, "/dev/i2c-1")
+	if err != nil {
+		slog.Error("failed to open I2C bus", "device", "/dev/i2c-1", "err", err)
+		return nil, nil, []string{"i2c bus open failed"}
+	}
+
+	// 2. Initialise the PCA9685. The library sets 50 Hz PWM in New(), which is
+	// what a hobby servo expects.
+	pca, err := pca9685.New(bus, nil)
+	if err != nil {
+		slog.Error("failed to initialize PCA9685", "err", err)
+		return bus, nil, []string{"pca9685 init failed"}
+	}
+
+	// 3. Create the servo and lower the barrier.
+	gateServo := pca.ServoNew(0, nil)
+	if err := gateServo.Angle(0); err != nil {
+		slog.Error("failed to lower the barrier initially", "err", err)
+		return bus, nil, []string{"initial barrier lowering failed"}
+	}
+
+	return bus, gateServo, nil
+}
+
+// openAngleFromEnv reads GATE_OPEN_ANGLE. The value is in the library's
+// actuation range (0-135 by default), not degrees of barrier travel: with the
+// default 750-2250 us pulse range, 90 is two thirds of the servo's sweep.
+func openAngleFromEnv() (int, error) {
+	raw := os.Getenv("GATE_OPEN_ANGLE")
+	if raw == "" {
+		return defaultOpenAngle, nil
+	}
+
+	angle, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("GATE_OPEN_ANGLE must be an integer, got %q", raw)
+	}
+	if angle < 0 || angle > pca9685.ServoRangeDef {
+		return 0, fmt.Errorf("GATE_OPEN_ANGLE must be between 0 and %d, got %d", pca9685.ServoRangeDef, angle)
+	}
+
+	return angle, nil
+}
+
+// publishRetained publishes at QoS 1 with the retained flag and reports whether
+// the broker acknowledged it.
+func publishRetained(c mqtt.Client, topic, payload string) bool {
+	token := c.Publish(topic, 1, true, payload)
+	if token.Wait() && token.Error() != nil {
+		slog.Error("failed to publish", "topic", topic, "err", token.Error())
+		return false
+	}
+	return true
+}
+
+// publishHealth publishes the retained diagnostics report.
+func publishHealth(c mqtt.Client, ok bool, symptoms []string, clientID string) {
+	payload, err := json.Marshal(healthReport{
+		OK:       ok,
+		Symptoms: symptoms,
+		ClientID: clientID,
+		At:       time.Now().UTC().Format(time.RFC3339),
+	})
+	if err != nil {
+		slog.Error("failed to encode health report", "err", err)
+		return
+	}
+	publishRetained(c, healthTopic, string(payload))
+}
+
+// initLogging sets up slog: Info level by default, output to stderr, adjustable
+// via LOG_LEVEL (debug / info / warn / error).
+func initLogging() {
 	level := slog.LevelInfo
 	if v := os.Getenv("LOG_LEVEL"); v != "" {
 		if err := level.UnmarshalText([]byte(v)); err != nil {
@@ -59,136 +313,6 @@ func main() {
 	}
 	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})
 	slog.SetDefault(slog.New(handler))
-
-	var symptoms []string
-
-	// 1. Open the I2C bus (typically /dev/i2c-1 on Raspberry Pi 5).
-	bus, err := i2c.New(pca9685.Address, "/dev/i2c-1")
-	if err != nil {
-		slog.Error("failed to open I2C bus", "err", err)
-		symptoms = append(symptoms, "I2C bus open failed")
-		bus = nil
-	} else {
-		defer bus.Close()
-	}
-
-	// 2. Initialize the PCA9685.
-	var pca *pca9685.PCA9685
-	if bus != nil {
-		pca, err = pca9685.New(bus, nil)
-		if err != nil {
-			slog.Error("failed to initialize PCA9685", "err", err)
-			symptoms = append(symptoms, "PCA9685 init failed")
-			pca = nil
-		}
-	}
-
-	// 3. Create the servo and lower the barrier.
-	var gateServo *pca9685.Servo
-	if pca != nil {
-		gateServo = pca.ServoNew(0, nil)
-		if err := gateServo.Angle(0); err != nil {
-			slog.Error("failed to lower the barrier initially", "err", err)
-			symptoms = append(symptoms, "initial barrier lowering failed")
-			gateServo = nil
-		}
-	}
-	if len(symptoms) == 0 {
-		slog.Info("system ready, barrier lowered")
-	}
-
-	// 4. Connect to MQTT.
-	tlsConfig, err := loadTLSConfig(caFile)
-	if err != nil {
-		slog.Error("failed to load CA certificate", "err", err)
-		os.Exit(1)
-	}
-
-	opts := mqtt.NewClientOptions()
-	opts.AddBroker(broker)
-	opts.SetClientID(clientId)
-	opts.SetUsername(username)
-	opts.SetPassword(password)
-	opts.SetTLSConfig(tlsConfig)
-	// Let the broker publish the offline state if the client drops unexpectedly.
-	opts.SetWill(stateTopic, "offline", 1, true)
-
-	client := mqtt.NewClient(opts)
-	if token := client.Connect(); token.Wait() && token.Error() != nil {
-		slog.Error("connection failed", "err", token.Error())
-		os.Exit(1)
-	}
-	slog.Info("MQTT connection established", "broker", broker, "client_id", clientId)
-
-	// 5. Publish the online state (including diagnostics).
-	initStatus := "online"
-	if len(symptoms) > 0 {
-		initStatus += " " + strings.Join(symptoms, ";")
-	}
-	if token := client.Publish(stateTopic, 1, true, initStatus); token.Wait() && token.Error() != nil {
-		slog.Warn("failed to publish online state", "err", token.Error())
-	}
-
-	// 6. On hardware failure: report diagnostics, go offline, and exit.
-	if len(symptoms) > 0 {
-		if token := client.Publish(stateTopic, 1, true, "offline"); token.Wait() && token.Error() != nil {
-			slog.Error("failed to publish offline state", "err", token.Error())
-		} else {
-			slog.Info("reported diagnostics and went offline", "symptoms", symptoms)
-		}
-		client.Disconnect(250)
-		os.Exit(1)
-	}
-
-	// 7. Subscribe to commands.
-	if token := client.Subscribe(cmdTopic, 1, func(c mqtt.Client, m mqtt.Message) {
-		cmd := string(m.Payload())
-		slog.Info("received command", "cmd", cmd)
-
-		switch cmd {
-		case "open":
-			if err := gateServo.Angle(90); err != nil {
-				slog.Error("failed to raise the barrier", "err", err)
-				return
-			}
-			slog.Info("barrier raised")
-			go publishPosition(c, gateTopic, "open")
-		case "close":
-			if err := gateServo.Angle(0); err != nil {
-				slog.Error("failed to lower the barrier", "err", err)
-				return
-			}
-			slog.Info("barrier lowered")
-			go publishPosition(c, gateTopic, "close")
-		default:
-			slog.Warn("unknown command", "cmd", cmd)
-		}
-	}); token.Wait() && token.Error() != nil {
-		slog.Error("subscription failed", "err", token.Error())
-		os.Exit(1)
-	}
-
-	// 8. Wait for an exit signal.
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
-	slog.Info("received exit signal, shutting down...")
-
-	// Publish the offline state proactively (retained, QoS 1).
-	if token := client.Publish(stateTopic, 1, true, "offline"); token.Wait() && token.Error() != nil {
-		slog.Error("failed to publish offline state", "err", token.Error())
-	} else {
-		slog.Info("published offline state: offline")
-	}
-
-	client.Disconnect(250)
-}
-
-// publishPosition publishes the barrier position asynchronously to avoid blocking the MQTT callback goroutine.
-func publishPosition(c mqtt.Client, topic, payload string) {
-	if t := c.Publish(topic, 1, true, payload); t.Wait() && t.Error() != nil {
-		slog.Error("failed to publish position state", "topic", topic, "err", t.Error())
-	}
 }
 
 func loadTLSConfig(caFile string) (*tls.Config, error) {
@@ -216,11 +340,4 @@ func generateClientID() string {
 		return fmt.Sprintf("device-%08x", os.Getpid())
 	}
 	return "device-" + hex.EncodeToString(b)
-}
-
-func getEnv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
 }
