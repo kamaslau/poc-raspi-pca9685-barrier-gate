@@ -11,11 +11,55 @@ A proof of concept, not a product: it answers one question — can a gate that i
 
 | Part | Connection | Note |
 |---|---|---|
-| Raspberry Pi 4 / 5 | I2C bus 1: GPIO 2 (SDA), GPIO 3 (SCL) | enable with `sudo raspi-config` → Interface → I2C, then `ls /dev/i2c-1` |
-| PCA9685 | address `0x40` on `/dev/i2c-1` | logic side runs at 3.3 V, which the Pi provides |
-| Servo | PCA9685 channel 0 | **separate 5 V supply, common ground with the Pi** — servo stall current will brown out the Pi's 5 V rail otherwise |
+| Raspberry Pi 4 / 5 | 3.3 V (physical pin 1) → PCA9685 `VCC`; GPIO 2 / SDA (pin 3) → `SDA`; GPIO 3 / SCL (pin 5) → `SCL`; GND (for example pin 6) → `GND` | Enable I2C with `sudo raspi-config` → Interface → I2C. `VCC` powers the PCA9685 logic; use the Pi's 3.3 V, not the MB102 5 V output. |
+| PCA9685 | I2C address `0x40` on `/dev/i2c-1` | `VCC` is logic power and is **not** the servo supply input `V+`. |
+| MB102 / servo supply | regulated 5 V → PCA9685 `V+`; supply GND → PCA9685 `GND` and Pi GND | **Common ground is required.** Use a supply rated for the servo's stall current; do not connect its 5 V output to the Pi's 3.3 V pin. |
+| Servo | PCA9685 channel 0 | An SG90, positional (not the 360° continuous variant). Connect to the channel's signal, `V+`, and `GND` pins. |
 
 The controller runs at 50 Hz, the rate a hobby servo expects. No other wiring is assumed: the gate mechanism is whatever the site already has, and the servo horn is the only point of contact.
+
+### Wiring
+
+```text
+┌────────────────────┐                             ┌───────────────────────┐
+│    Raspberry Pi    │                             │        PCA9685        │
+│                    │                             │   0x40 · /dev/i2c-1   │
+│ 3V3        (1)  ●──┼─────────────────────────────┼──● VCC                │
+│ GPIO2/SDA  (3)  ●──┼─────────────────────────────┼──● SDA                │
+│ GPIO3/SCL  (5)  ●──┼─────────────────────────────┼──● SCL                │
+│ GND        (6)  ●──┼─────────────────────────────┼──● GND                │
+│                    │                             │                       │
+└────────────────────┘                             │                       │
+                                                   │                       │
+                       ┌──────────────────────┐    │                       │
+                       │        MB102         │    │                       │
+                       │   5V · 2A or more    │    │                       │
+                       │  V+  ●───────────────┼────┼──● V+  (servo rail)   │
+                       │  GND ●───────────────┼────┼──● GND (servo return) │
+                       └──────────────────────┘    │                       │
+                                                   │    S    +    −        │
+                                                   └────┬────┬────┬────────┘
+                                                        │    │    │
+                                                        │    │    │
+                                                     ┌──┴────┴────┴──┐
+                                                     │     SG90      │
+                                                     │  S    +    −  │
+                                                     └───────────────┘
+```
+
+The numbers in brackets are physical pins on the Pi header, not GPIO numbers. Two supplies meet here and are not interchangeable: the Pi's **3.3 V** powers the PCA9685 logic (`VCC`) and the I²C bus, and the **5 V** supply powers the servo through `V+`. Never take servo power from the Pi's own 5 V pins — a stalling servo pulls several hundred milliamps from a rail the Pi shares with its USB ports.
+
+Ground is one net, and every part reaches it. Without that shared reference the pulse means nothing to the servo: it buzzes and will not move.
+
+`2A or more` is not decoration. An MB102-class breadboard supply is rated around 700 mA, and a servo that stalls on it draws more than that, so the module's protection trips: the LED lights at rest and goes out under a command. The gate then goes silent and free-turning with nothing wrong in the log. If you see that, the supply is the fault, not the servo.
+
+### Troubleshooting `remote I/O error`
+
+`/dev/i2c-1` existing only confirms that the Pi's I2C adapter is available; it does not confirm that a PCA9685 is powered or responding. The application expects a device at address `0x40`. If initialization reports `remote I/O error`:
+
+1. Stop the application and verify the wiring above, especially **Pi 3.3 V → PCA9685 `VCC`**. Supplying 5 V to `V+` does not power the PCA9685 logic.
+2. Check that SDA goes to SDA, SCL goes to SCL (not “SDL”), and the Pi, PCA9685, and MB102 grounds are connected together.
+3. Check that the PCA9685 address jumpers leave it at `0x40` (the board's usual default). With `i2c-tools` installed, run `sudo i2cdetect -y 1`; `40` should appear. `70` will appear too — that is the chip's all-call address, not a second device, and no re-jumpering is needed for it. A missing `40` means the board is not acknowledging on this bus—recheck power, wiring, and address before running the application again.
 
 ## Topics
 
@@ -51,7 +95,9 @@ The broker URI needs the `ssl://` scheme (`ssl://host:8883`); the client verifie
 
 ### `GATE_OPEN_ANGLE`
 
-The value is in the servo library's actuation range — 0 to 135 with the defaults — and **not** in degrees of barrier travel. With the default 750–2250 µs pulse range, `90` is two thirds of the sweep, about 1750 µs. Set it by watching the barrier, not by reading the number: the linkage between horn and arm decides what a given angle looks like at the gate.
+The value is in the servo's actuation range — 0 to 180 — and **not** in degrees of barrier travel. That range is mapped onto a 1000–2000 µs pulse band: `0` is 1000 µs, `180` is 2000 µs, and the default `90` is 1500 µs. Both ends of the band sit inside an SG90's mechanical travel, so no commanded position parks the horn against its stop — that stall is what strips the nylon gear train in the first place.
+
+The band spans roughly 90° of horn travel, which is the swing a barrier arm wants. Set the value by watching the barrier, not by reading the number: the linkage between horn and arm decides what a given angle looks like at the gate. Widening the pulses beyond 1000–2000 µs (`servoMinPulse` / `servoMaxPulse` in `main.go`) buys travel by grinding the stops, so tune `GATE_OPEN_ANGLE` first.
 
 ## Exit codes
 
@@ -99,7 +145,7 @@ Unit tests cover configuration parsing and the health payload shape: `go test ./
 
 **State separated from diagnostics.** `online` / `offline` is a fact a rule can compare; `online i2c bus open failed` is a sentence. The first version put both in one payload, which left every consumer parsing free text to answer a yes/no question.
 
-**A retained position, not a retained command ack.** The command topic is not retained: replaying `open` to a client that reconnects would move a gate nobody asked to move. The position is retained instead, so the state of the barrier is readable at any time without an ack round trip.
+**A retained position, not a retained command ack.** The command topic is not retained: replaying `open` to a client that reconnects would move a gate nobody asked to move. The retain flag belongs to the publisher, though, so a command that *arrives* retained is refused on receipt — one stray retained `open` would otherwise re-open the gate after every reconnect. The position is retained instead, and republished when start-up parks the barrier, so that topic never describes a position the gate has already left.
 
 **Last will plus a republish on connect.** The will covers "the process died" — the broker says `offline` on our behalf. It cannot cover "the process came back", so `OnConnect` republishes `online` and re-subscribes on every connection. paho does not restore subscriptions after a reconnect by default (`ResumeSubs` is false, the session is clean), which is the failure this exists to prevent.
 

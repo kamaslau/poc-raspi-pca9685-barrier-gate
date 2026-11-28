@@ -16,10 +16,10 @@ func TestOpenAngleFromEnv(t *testing.T) {
 		{name: "unset falls back to default", value: "", want: defaultOpenAngle},
 		{name: "explicit value", value: "120", want: 120},
 		{name: "lower bound", value: "0", want: 0},
-		{name: "upper bound", value: "135", want: 135},
+		{name: "upper bound", value: "180", want: 180},
 		{name: "not an integer", value: "ninety", wantErr: "must be an integer"},
-		{name: "above the actuation range", value: "136", wantErr: "must be between 0 and 135"},
-		{name: "negative", value: "-1", wantErr: "must be between 0 and 135"},
+		{name: "above the actuation range", value: "181", wantErr: "must be between 0 and 180"},
+		{name: "negative", value: "-1", wantErr: "must be between 0 and 180"},
 	}
 
 	for _, tc := range cases {
@@ -38,6 +38,36 @@ func TestOpenAngleFromEnv(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Fatalf("want %d, got %d", tc.want, got)
+			}
+		})
+	}
+}
+
+func TestParseCommand(t *testing.T) {
+	cases := []struct {
+		name     string
+		payload  string
+		retained bool
+		want     string
+		wantOK   bool
+	}{
+		{name: "open", payload: "open", want: "open", wantOK: true},
+		{name: "close", payload: "close", want: "close", wantOK: true},
+		{name: "surrounding whitespace", payload: " open\n", want: "open", wantOK: true},
+		{name: "retained open is a replay", payload: "open", retained: true, wantOK: false},
+		{name: "retained close is a replay", payload: "close", retained: true, wantOK: false},
+		{name: "unknown command", payload: "raise", wantOK: false},
+		{name: "empty", payload: "", wantOK: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := parseCommand([]byte(tc.payload), tc.retained)
+			if ok != tc.wantOK {
+				t.Fatalf("want ok=%v, got %v", tc.wantOK, ok)
+			}
+			if got != tc.want {
+				t.Fatalf("want %q, got %q", tc.want, got)
 			}
 		})
 	}

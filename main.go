@@ -52,6 +52,21 @@ const (
 	defaultOpenAngle = 90
 )
 
+// The actuator is an SG90: 180 units of actuation, driven over a 1000-2000 us
+// pulse band. The library defaults (750-2250 us over 135 units) are wrong for
+// it in both directions - the range is not 135, and 750 us sits past the low
+// mechanical stop, so parking the gate at angle 0 leaves the servo stalled
+// against the case. The gear train is nylon, and that is how it strips.
+//
+// Units, not degrees: the band spans roughly 90 degrees of horn travel, which
+// is what a barrier arm wants. Wider pulses than these buy travel at the cost
+// of grinding the stops, so the travel is tuned with GATE_OPEN_ANGLE instead.
+const (
+	servoSweep    = 180  // actuation range, in the library's angle units
+	servoMinPulse = 1000 // us at angle 0
+	servoMaxPulse = 2000 // us at servoSweep
+)
+
 // healthReport is the retained payload on healthTopic. It carries what the
 // start-up sequence managed to bring up, so a subscriber never has to read the
 // process log to find out why a gate did not move.
@@ -162,7 +177,15 @@ func main() {
 		os.Exit(exitHardware)
 	}
 
-	// 6. Wait for an exit signal.
+	// 6. Hardware start-up parked the barrier, so the retained position is
+	// `close` whatever a previous run left on the topic. Without this, a
+	// restart that lowers the gate leaves the topic claiming `open`, and the
+	// position is the one retained value a consumer is meant to trust.
+	if publishRetained(client, positionTopic, positionClosed) {
+		slog.Info("published position", "topic", positionTopic, "position", positionClosed)
+	}
+
+	// 7. Wait for an exit signal.
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
@@ -202,7 +225,10 @@ func onConnect(c mqtt.Client, hardwareOK bool, symptoms []string, clientID strin
 // separate goroutine so a slow broker cannot stall the MQTT callback.
 func commandHandler(c mqtt.Client, servo *pca9685.Servo, openAngle int) mqtt.MessageHandler {
 	return func(_ mqtt.Client, m mqtt.Message) {
-		cmd := strings.TrimSpace(string(m.Payload()))
+		cmd, ok := parseCommand(m.Payload(), m.Retained())
+		if !ok {
+			return
+		}
 		slog.Info("received command", "cmd", cmd)
 
 		switch cmd {
@@ -220,9 +246,30 @@ func commandHandler(c mqtt.Client, servo *pca9685.Servo, openAngle int) mqtt.Mes
 			}
 			slog.Info("barrier lowered")
 			go publishRetained(c, positionTopic, positionClosed)
-		default:
-			slog.Warn("unknown command", "cmd", cmd)
 		}
+	}
+}
+
+// parseCommand validates a command payload before anything moves.
+//
+// A retained command is a replay of something that already ran: the broker hands
+// it to every subscriber that arrives later, including this device after every
+// reconnect. Acting on it would move a gate nobody asked to move, and the retain
+// flag belongs to the publisher, so refusing it here is the only place this can
+// be enforced.
+func parseCommand(payload []byte, retained bool) (string, bool) {
+	cmd := strings.TrimSpace(string(payload))
+	if retained {
+		slog.Warn("ignoring retained command", "cmd", cmd, "hint", "publish without the retain flag, and clear the retained message")
+		return "", false
+	}
+
+	switch cmd {
+	case positionOpen, positionClosed:
+		return cmd, true
+	default:
+		slog.Warn("unknown command", "cmd", cmd)
+		return "", false
 	}
 }
 
@@ -242,12 +289,19 @@ func initHardware() (*i2c.Options, *pca9685.Servo, []string) {
 	// what a hobby servo expects.
 	pca, err := pca9685.New(bus, nil)
 	if err != nil {
-		slog.Error("failed to initialize PCA9685", "err", err)
+		slog.Error("failed to initialize PCA9685", "address", "0x40", "err", err,
+			"hint", "check PCA9685 VCC (3.3V), SDA/SCL wiring, common ground, and address jumpers")
 		return bus, nil, []string{"pca9685 init failed"}
 	}
 
-	// 3. Create the servo and lower the barrier.
-	gateServo := pca.ServoNew(0, nil)
+	// 3. Create the servo and lower the barrier. The pulse band is explicit so
+	// the parked position is angle 0 -> servoMinPulse, not a library default
+	// that would hold the horn against its stop.
+	gateServo := pca.ServoNew(0, &pca9685.ServOptions{
+		AcRange:  servoSweep,
+		MinPulse: servoMinPulse,
+		MaxPulse: servoMaxPulse,
+	})
 	if err := gateServo.Angle(0); err != nil {
 		slog.Error("failed to lower the barrier initially", "err", err)
 		return bus, nil, []string{"initial barrier lowering failed"}
@@ -256,9 +310,9 @@ func initHardware() (*i2c.Options, *pca9685.Servo, []string) {
 	return bus, gateServo, nil
 }
 
-// openAngleFromEnv reads GATE_OPEN_ANGLE. The value is in the library's
-// actuation range (0-135 by default), not degrees of barrier travel: with the
-// default 750-2250 us pulse range, 90 is two thirds of the servo's sweep.
+// openAngleFromEnv reads GATE_OPEN_ANGLE. The value is in the servo's actuation
+// range (0-180 for the SG90), not degrees of barrier travel: the range is mapped
+// onto the 1000-2000 us pulse band, so 90 is 1500 us.
 func openAngleFromEnv() (int, error) {
 	raw := os.Getenv("GATE_OPEN_ANGLE")
 	if raw == "" {
@@ -269,8 +323,8 @@ func openAngleFromEnv() (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("GATE_OPEN_ANGLE must be an integer, got %q", raw)
 	}
-	if angle < 0 || angle > pca9685.ServoRangeDef {
-		return 0, fmt.Errorf("GATE_OPEN_ANGLE must be between 0 and %d, got %d", pca9685.ServoRangeDef, angle)
+	if angle < 0 || angle > servoSweep {
+		return 0, fmt.Errorf("GATE_OPEN_ANGLE must be between 0 and %d, got %d", servoSweep, angle)
 	}
 
 	return angle, nil
